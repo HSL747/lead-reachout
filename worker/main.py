@@ -25,9 +25,28 @@ def _send(to_email: str, subject: str, body_plain: str, body_html: str | None) -
         smtp.sendmail(GMAIL_ADDRESS, to_email, msg.as_string())
 
 
+def _ensure_table(conn) -> None:
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS send_queue (
+                    id          SERIAL      PRIMARY KEY,
+                    to_email    TEXT        NOT NULL,
+                    subject     TEXT        NOT NULL,
+                    body_plain  TEXT        NOT NULL,
+                    body_html   TEXT,
+                    send_at     TIMESTAMPTZ NOT NULL,
+                    sent_at     TIMESTAMPTZ,
+                    lead_ref    TEXT,
+                    created_at  TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+
 def run() -> None:
     now  = datetime.now(timezone.utc)
     conn = psycopg2.connect(DATABASE_URL)
+    _ensure_table(conn)
 
     with conn.cursor() as cur:
         cur.execute(
