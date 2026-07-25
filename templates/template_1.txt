@@ -1,0 +1,12 @@
+Hi {{name}},
+
+I’m reaching out because I strongly believe we have a system that will help {{company}}. {{hook}}
+
+Our system automatically sends text messages to unanswered calls, prompting them to respond. Text messages are much more effective than voicemail or forms at bringing in customers for {{trade_plural}}. I’m confident that {{company}} would bring in more customers each month when using this method. 
+
+Whilst we establish our company, we are offering the system for free. This also gives you the chance to test things out to see if it works for you.
+
+If this interests you, please give me a call or email. We can only take on a few companies.
+
+Kind regards,
+Henry
