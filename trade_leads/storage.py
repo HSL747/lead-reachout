@@ -323,8 +323,9 @@ def _parse_area(address: str) -> str:
 
 
 def get_scheduled_send_times(for_date: "date | None" = None) -> list[datetime]:
-    """Return all future scheduled send times across initial emails and follow-ups."""
-    now = datetime.now()
+    """Return all future scheduled send times (UTC-aware) across initial emails and follow-ups."""
+    from datetime import timezone as _tz
+    now_utc = datetime.now(_tz.utc)
     with _conn() as conn:
         rows = conn.execute(
             "SELECT scheduled_send_at, followup1_scheduled_at, followup2_scheduled_at FROM leads"
@@ -337,7 +338,9 @@ def get_scheduled_send_times(for_date: "date | None" = None) -> list[datetime]:
                 continue
             try:
                 dt = datetime.fromisoformat(val)
-                if dt > now and (for_date is None or dt.date() == for_date):
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                if dt > now_utc and (for_date is None or dt.date() == for_date):
                     result.append(dt)
             except (ValueError, TypeError):
                 continue

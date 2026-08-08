@@ -8,6 +8,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
+
+_UK_TZ = ZoneInfo("Europe/London")
 
 if TYPE_CHECKING:
     pass
@@ -95,36 +98,44 @@ def _build_mime(to_email: str, subject: str, body: str, sig_html: str) -> MIMEMu
 
 
 def next_send_slot(already_scheduled: list[datetime]) -> datetime:
-    """Return the next available send slot within 8am–5pm, max 40/day.
+    """Return the next free UTC send slot within 8am–5pm UK time, max 40/day.
 
-    Searches today first, then tomorrow, then the day after.
-    Slots are evenly distributed across the working window.
+    Returns a timezone-aware UTC datetime so it compares correctly against
+    Railway PostgreSQL (which stores and compares everything in UTC).
     """
-    window_minutes = (_DAY_END_HOUR - _DAY_START_HOUR) * 60  # 540
-    interval = timedelta(minutes=window_minutes / _MAX_PER_DAY)  # 13.5 min
-    now = datetime.now()
+    window_minutes = (_DAY_END_HOUR - _DAY_START_HOUR) * 60
+    interval = timedelta(minutes=window_minutes / _MAX_PER_DAY)
+    now_utc = datetime.now(timezone.utc)
+
+    def _to_utc(dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     for days_ahead in range(7):
-        target_date = now.date() + timedelta(days=days_ahead)
-        day_start = datetime(target_date.year, target_date.month, target_date.day, _DAY_START_HOUR, 0)
-        day_end   = datetime(target_date.year, target_date.month, target_date.day, _DAY_END_HOUR, 0)
+        uk_date   = (now_utc.astimezone(_UK_TZ) + timedelta(days=days_ahead)).date()
+        start_utc = datetime(uk_date.year, uk_date.month, uk_date.day,
+                             _DAY_START_HOUR, 0, tzinfo=_UK_TZ).astimezone(timezone.utc)
+        end_utc   = datetime(uk_date.year, uk_date.month, uk_date.day,
+                             _DAY_END_HOUR, 0, tzinfo=_UK_TZ).astimezone(timezone.utc)
 
-        day_slots = [day_start + i * interval for i in range(_MAX_PER_DAY)]
-        day_taken = [t for t in already_scheduled if t.date() == target_date]
+        slots = [start_utc + i * interval for i in range(_MAX_PER_DAY)]
+        taken = [_to_utc(t) for t in already_scheduled
+                 if _to_utc(t).date() == start_utc.date()]
 
-        for slot in day_slots:
-            if slot < now:          # already passed
+        for slot in slots:
+            if slot < now_utc:
                 continue
-            if slot >= day_end:     # outside working window
+            if slot >= end_utc:
                 break
-            # Slot is free if no existing schedule is within half an interval of it
             half = interval / 2
-            if not any(abs((slot - t).total_seconds()) <= half.total_seconds() for t in day_taken):
+            if not any(abs((slot - t).total_seconds()) <= half.total_seconds() for t in taken):
                 return slot
 
-    # Fallback: first slot of the next unchecked working day
-    fallback_date = now.date() + timedelta(days=7)
-    return datetime(fallback_date.year, fallback_date.month, fallback_date.day, _DAY_START_HOUR, 0)
+    # Fallback: first slot 7 days out
+    uk_date = (now_utc.astimezone(_UK_TZ) + timedelta(days=7)).date()
+    return datetime(uk_date.year, uk_date.month, uk_date.day,
+                    _DAY_START_HOUR, 0, tzinfo=_UK_TZ).astimezone(timezone.utc)
 
 
 def get_signature_html(service) -> str:

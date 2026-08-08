@@ -371,8 +371,8 @@ def _draft_one(
 
     try:
         already_scheduled = get_scheduled_send_times()
-        slot     = next_send_slot(already_scheduled)
-        slot_str = slot.strftime("%a %d %b at %H:%M")
+        slot      = next_send_slot(already_scheduled)  # UTC-aware
+        slot_str  = slot.astimezone().strftime("%a %d %b at %H:%M")  # display in local time
 
         body_html = build_html_body(draft_text, sig_html)
         send_queue.enqueue(email, subject, draft_text, body_html, slot, lead_ref=str(rowid))
