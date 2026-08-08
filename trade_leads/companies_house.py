@@ -16,6 +16,26 @@ _SUFFIXES = re.compile(
     re.IGNORECASE,
 )
 
+_MALE_TITLES = {"mr", "sir", "lord", "rev", "revd", "dr"}
+
+# Common UK male first names (lowercase) for fallback gender inference
+_MALE_NAMES = {
+    "james", "john", "robert", "michael", "william", "david", "richard",
+    "joseph", "thomas", "charles", "christopher", "daniel", "matthew",
+    "anthony", "donald", "mark", "paul", "steven", "steve", "andrew",
+    "kenneth", "george", "kevin", "brian", "edward", "ronald", "timothy",
+    "jason", "jeffrey", "ryan", "gary", "jacob", "nicholas", "eric",
+    "jonathan", "stephen", "larry", "scott", "frank", "justin", "brandon",
+    "raymond", "gregory", "samuel", "benjamin", "patrick", "jack", "dennis",
+    "peter", "harry", "adam", "ian", "alan", "barry", "wayne", "graham",
+    "neil", "craig", "lee", "dean", "shaun", "darren", "simon", "martin",
+    "colin", "gareth", "phil", "phillip", "derek", "stewart", "stuart",
+    "brett", "robin", "ben", "mike", "dave", "chris", "tony", "rob",
+    "matt", "dan", "luke", "sean", "liam", "owen", "callum", "jamie",
+    "nathan", "carl", "karl", "keith", "glen", "glen", "clive", "nigel",
+    "geoff", "geoffrey", "julian", "alex", "tim", "sam", "joe", "jon",
+}
+
 
 def _first_name(full_name: str) -> str:
     """Parse first name from Companies House format 'SURNAME, Firstname Middle'."""
@@ -25,6 +45,15 @@ def _first_name(full_name: str) -> str:
     else:
         first = full_name.split()[0] if full_name else ""
     return first.capitalize()
+
+
+def _is_likely_male(officer: dict) -> bool:
+    """Return True if the officer appears to be male, using title then first-name heuristic."""
+    title = officer.get("title", "").lower().rstrip(".")
+    if title in _MALE_TITLES:
+        return True
+    first = _first_name(officer.get("name", "")).lower()
+    return first in _MALE_NAMES
 
 
 def _normalise(name: str) -> str:
@@ -113,17 +142,23 @@ def lookup_director(api_key: str, company_name: str) -> tuple[str, str] | None:
         )
         resp.raise_for_status()
 
-        for officer in resp.json().get("items", []):
-            if officer.get("resigned_on"):
-                continue
-            if officer.get("officer_role", "").lower() in _DIRECTOR_ROLES:
-                full_name = officer.get("name", "")
-                first = _first_name(full_name)
-                if first:
-                    return first, full_name
+        active_directors = [
+            o for o in resp.json().get("items", [])
+            if not o.get("resigned_on")
+            and o.get("officer_role", "").lower() in _DIRECTOR_ROLES
+        ]
 
-        log.debug("No active director found for company %s", company_number)
-        return None
+        if not active_directors:
+            log.debug("No active director found for company %s", company_number)
+            return None
+
+        # Prefer male director (handles husband-and-wife pairs)
+        male = next((o for o in active_directors if _is_likely_male(o)), None)
+        chosen = male or active_directors[0]
+
+        full_name = chosen.get("name", "")
+        first = _first_name(full_name)
+        return (first, full_name) if first else None
 
     except Exception as exc:
         log.warning("CH officers lookup failed for %s: %s", company_number, exc)

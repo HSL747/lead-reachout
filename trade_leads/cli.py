@@ -148,93 +148,148 @@ def search(trade: str, location: str, radius: int, limit: int, dry_run: bool) ->
 # ---------------------------------------------------------------------------
 
 @cli.command()
-@click.option("--id", "lead_id", type=int, default=None, help="Numeric lead ID (from 'list'). Omit to use next uncontacted.")
-@click.option("--template", "template_num", type=int, default=None, help="Override template number (1-5)")
-@click.option("--debug", is_flag=True, default=False, help="Enable debug logging")
+@click.option("--id", "lead_id", type=int, default=None, help="Target a specific lead ID. Omit to process all uncontacted leads.")
+@click.option("--template", "template_num", type=int, default=None, help="Force a specific template (1 or 2) for every lead in this run.")
+@click.option("--debug", is_flag=True, default=False, help="Enable debug logging.")
 def draft(lead_id: int | None, template_num: int | None, debug: bool) -> None:
-    """Write a hook, pick a template, and save the draft email."""
+    """Auto-draft and schedule outreach for all uncontacted leads."""
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
     init_db()
     tm = TemplateManager(_TEMPLATES_DIR)
 
-    # Load lead
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    ch_key        = os.environ.get("COMPANIES_HOUSE_API_KEY", "")
+
+    # Authenticate Gmail and initialise the Railway queue once
+    service  = None
+    sig_html = ""
+    if gmail_is_configured():
+        try:
+            service  = gmail_authenticate()
+            sig_html = get_signature_html(service)
+            send_queue.init_queue()
+        except Exception as exc:
+            click.echo(f"Gmail setup failed: {exc}")
+
+    queued = skipped = 0
+
     if lead_id is not None:
         lead = get_lead_by_id(lead_id)
         if not lead:
             raise click.ClickException(f"No lead found with ID {lead_id}")
+        if _draft_one(lead, template_num, tm, anthropic_key, ch_key, service, sig_html):
+            queued += 1
+        else:
+            skipped += 1
     else:
-        lead = get_next_uncontacted()
-        if not lead:
-            raise click.ClickException(
-                "No uncontacted leads with valid emails found. "
-                "Run 'trade-leads search' or check your lead statuses."
-            )
+        while True:
+            lead = get_next_uncontacted()
+            if not lead:
+                break
+            if _draft_one(lead, template_num, tm, anthropic_key, ch_key, service, sig_html):
+                queued += 1
+            else:
+                skipped += 1
 
-    rowid = lead["_rowid"]
-    place_id = lead["_place_id"]
-    name = lead.get("name", "")
-    display_name = _clean_company_name(name)
-    trade = lead.get("trade", "unknown")
-    address = lead.get("address", "")
-    area = _parse_area(address)
-    score = lead.get("missed_call_score", 0)
-    email = lead.get("email", "")
-    email_status = lead.get("email_validation_status", "")
-    website = lead.get("website", "")
-    rating = lead.get("rating")
-    review_count = lead.get("review_count", 0)
-    excerpts = [e for e in lead.get("top_review_excerpts", "").split(" | ") if e]
-    notes = lead.get("notes") or ""
+    click.echo(f"\n{'='*60}")
+    click.echo(f"  Done — {queued} queued, {skipped} skipped.")
+    click.echo(f"{'='*60}\n")
 
-    # Display lead summary
-    click.echo("\n" + "=" * 60)
-    click.echo(f"  Lead ID  : {rowid}")
-    click.echo(f"  Business : {name}")
-    click.echo(f"  Trade    : {trade}")
-    click.echo(f"  Area     : {area or address}")
-    click.echo(f"  Email    : {email or '(none)'}")
-    click.echo(f"  Website  : {website or '(none)'}")
-    click.echo(f"  Rating   : {rating} ({review_count} reviews)  |  Missed-call score: {score}/3")
-    if excerpts:
-        click.echo(f"  Reviews  :")
-        for excerpt in excerpts:
-            click.echo(f"    \"{excerpt}\"")
-    if notes:
-        click.echo(f"  Notes    : {notes}")
-    click.echo("=" * 60 + "\n")
 
-    # Email validation warning
-    if email_status in _RISKY_STATUSES:
-        click.echo(f"  [!] Email validation status: {email_status.upper()}")
-        if not click.confirm("  Proceed with this lead anyway?", default=False):
-            click.echo("Aborted.")
-            return
-        click.echo()
+def _auto_pick_template(review_count: int) -> int:
+    """Weighted random template selection based on review count.
 
-    # Template selection (before hook generation so hooks match the template angle)
-    click.echo()
-    _show_template_list(tm)
+    35+ reviews → 70 % chance of template 1 (missed-call), 30 % template 2 (reviews).
+    <35 reviews  → 30 % missed-call, 70 % reviews.
+    Either template is always possible.
+    """
+    import random
+    if review_count >= 35:
+        return random.choices([1, 2], weights=[70, 30])[0]
+    return random.choices([1, 2], weights=[30, 70])[0]
 
-    if template_num is None:
-        override = click.prompt(
-            "Template number",
-            default="1",
-            show_default=True,
-        ).strip()
+
+def _auto_pick_subject(
+    business_name: str,
+    trade: str,
+    area: str,
+    hook: str,
+    template_num: int,
+    anthropic_key: str,
+) -> str:
+    """Generate subject lines and pick one at random."""
+    import random
+    hardcoded = (
+        f"More Google reviews for {business_name}"
+        if template_num == 2
+        else f"Missed calls are losing {business_name} jobs"
+    )
+    if anthropic_key:
         try:
-            template_num = int(override)
-        except ValueError:
-            template_num = 1
+            client = _make_anthropic_client(anthropic_key)
+            subjects = generate_subjects(client, business_name, trade, area, hook, template_num=template_num)
+            pool = [s for s in subjects if s] + [hardcoded]
+            return random.choice(pool)
+        except Exception as exc:
+            log.warning(f"Subject generation failed: {exc}")
+    return hardcoded
 
-    # Companies House name lookup
-    ch_key = os.environ.get("COMPANIES_HOUSE_API_KEY", "")
+
+def _draft_one(
+    lead: dict,
+    template_num_override: int | None,
+    tm: TemplateManager,
+    anthropic_key: str,
+    ch_key: str,
+    service,
+    sig_html: str,
+) -> bool:
+    """Draft and queue one lead. Returns True if queued, False if skipped."""
+    rowid    = lead["_rowid"]
+    place_id = lead["_place_id"]
+    name     = lead.get("name", "")
+    display_name = _clean_company_name(name)
+    trade    = lead.get("trade", "unknown")
+    address  = lead.get("address", "")
+    area     = _parse_area(address)
+    score    = lead.get("missed_call_score", 0)
+    email    = lead.get("email", "")
+    email_status = lead.get("email_validation_status", "")
+    website  = lead.get("website", "")
+    rating   = lead.get("rating")
+    review_count = lead.get("review_count", 0) or 0
+    excerpts = [e for e in lead.get("top_review_excerpts", "").split(" | ") if e]
+
+    click.echo(f"\n{'='*60}")
+    click.echo(f"  Lead {rowid}: {name}")
+    click.echo(f"  Email: {email or '(none)'}  |  Reviews: {review_count}  |  Score: {score}/3")
+    click.echo(f"  {'-'*56}")
+
+    # Skip risky/missing emails silently
+    if not email:
+        click.echo("  Skipped — no email address.")
+        return False
+    if email_status in _RISKY_STATUSES:
+        click.echo(f"  Skipped — email status: {email_status}.")
+        return False
+
+    # Template
+    if template_num_override is not None:
+        template_num = template_num_override
+        click.echo(f"  Template : {template_num} (override)")
+    else:
+        template_num = _auto_pick_template(review_count)
+        angle  = "missed-call" if template_num == 1 else "reviews"
+        weight = "≥35 reviews → missed-call weighted" if review_count >= 35 else "<35 reviews → review-gen weighted"
+        click.echo(f"  Template : {template_num} ({angle})  [{weight}]")
+
+    # Companies House director lookup
     ch_result = lookup_director(ch_key, name) if ch_key else None
 
-    # Hook generation — style matches the chosen template
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    # Hook generation — most relevant hook is index 0 (Claude ranks them)
     selected_hook = ""
-    review_name = ""
+    review_name   = ""
     if anthropic_key:
         try:
             client = _make_anthropic_client(anthropic_key)
@@ -250,52 +305,25 @@ def draft(lead_id: int | None, template_num: int | None, debug: bool) -> None:
                 review_count=review_count,
                 template_body=tm.get_raw(template_num),
             )
-            click.echo("\nHook options:")
-            for i, h in enumerate(hooks, 1):
-                click.echo(f"  {i}. {h}")
-            click.echo()
-            raw = click.prompt(
-                "Select hook [1/2/3] or type your own",
-                default="1",
-                show_default=True,
-            ).strip()
-            if raw in ("1", "2", "3"):
-                idx = int(raw) - 1
-                selected_hook = hooks[idx] if idx < len(hooks) else hooks[0]
-            else:
-                selected_hook = raw
+            selected_hook = hooks[0] if hooks else ""
         except Exception as exc:
-            log.warning(f"Hook generation failed: {exc}")
-            selected_hook = click.prompt("Enter your hook for this email").strip()
-    else:
-        selected_hook = click.prompt("Enter your hook for this email").strip()
+            log.warning(f"Hook generation failed for {name}: {exc}")
 
-    # Determine recipient name
+    if not selected_hook:
+        selected_hook = f"I came across {display_name} and had a quick question."
+
+    click.echo(f"  Hook     : {selected_hook}")
+
+    # Recipient name — prefer male CH director
     if ch_result:
-        found_name, ch_full = ch_result
-        name_source = f"Companies House: {ch_full}"
+        confirmed_name, ch_full = ch_result
+        click.echo(f"  Name     : {confirmed_name}  [CH: {ch_full}]")
     elif review_name:
-        found_name = review_name
-        name_source = "reviews"
+        confirmed_name = review_name
+        click.echo(f"  Name     : {confirmed_name}  [reviews/about page]")
     else:
-        found_name = ""
-        name_source = ""
-
-    if found_name:
-        click.echo(f"\nName: {found_name}  ({name_source})")
-        raw_name = click.prompt(
-            "Press Enter to use this name or type a different one",
-            default=found_name,
-            show_default=False,
-        ).strip()
-    else:
-        click.echo("\nNo name found automatically.")
-        raw_name = click.prompt(
-            "Recipient name (Enter to leave blank)",
-            default="",
-            show_default=False,
-        ).strip()
-    confirmed_name = raw_name
+        confirmed_name = ""
+        click.echo("  Name     : (none found)")
 
     # Fill template
     try:
@@ -310,18 +338,14 @@ def draft(lead_id: int | None, template_num: int | None, debug: bool) -> None:
             fill_kwargs["name"] = confirmed_name
         draft_text = tm.fill(template_num, **fill_kwargs)
     except ValueError as exc:
-        raise click.ClickException(str(exc))
+        click.echo(f"  Skipped — template error: {exc}")
+        return False
 
-    click.echo("\n" + "-" * 60)
-    click.echo("DRAFT EMAIL")
-    click.echo("-" * 60)
-    click.echo(draft_text)
-    click.echo("-" * 60 + "\n")
+    # Subject — random pick from generated options
+    subject = _auto_pick_subject(display_name, trade, area, selected_hook, template_num, anthropic_key)
+    click.echo(f"  Subject  : {subject}")
 
-    # Subject line
-    subject = _pick_subject(display_name, trade, area, selected_hook, template_num=template_num)
-
-    # Save to DB
+    # Save draft to local DB
     now = _now_iso()
     update_lead_pipeline(
         place_id,
@@ -332,85 +356,33 @@ def draft(lead_id: int | None, template_num: int | None, debug: bool) -> None:
         subject=subject,
         status="drafted",
     )
-    click.echo(f"Draft saved (lead ID {rowid}).")
 
-    # Queue for scheduled send via Railway worker
-    if email and gmail_is_configured():
-        try:
-            service = gmail_authenticate()
-            already_scheduled = get_scheduled_send_times()
-            slot = next_send_slot(already_scheduled)
-            slot_str = slot.strftime("%a %d %b at %H:%M")
+    # Enqueue via Railway
+    if service is None:
+        click.echo("  (Gmail not configured — draft saved, not queued)")
+        return False
 
-            sig_html  = get_signature_html(service)
-            body_html = build_html_body(draft_text, sig_html)
+    try:
+        already_scheduled = get_scheduled_send_times()
+        slot     = next_send_slot(already_scheduled)
+        slot_str = slot.strftime("%a %d %b at %H:%M")
 
-            send_queue.init_queue()
-            send_queue.enqueue(email, subject, draft_text, body_html, slot, lead_ref=str(rowid))
+        body_html = build_html_body(draft_text, sig_html)
+        send_queue.enqueue(email, subject, draft_text, body_html, slot, lead_ref=str(rowid))
 
-            update_lead_pipeline(
-                place_id,
-                scheduled_send_at=slot.isoformat(),
-                status="emailed",
-                sent_at=slot.isoformat(),
-            )
-            fu1, fu2 = followup_due_dates(slot.isoformat())
-            update_lead_pipeline(place_id, followup1_due=fu1, followup2_due=fu2)
-            click.echo(f"Queued — Railway will send this on {slot_str}.")
-        except Exception as exc:
-            click.echo(f"Scheduling failed: {exc}")
-    elif email and not gmail_is_configured():
-        click.echo("(Gmail not connected — see README to set up one-click draft creation)")
-
-    click.echo()
-    if click.confirm("Draft next lead?", default=True):
-        ctx = click.get_current_context()
-        ctx.invoke(draft, lead_id=None, template_num=None)
-
-
-def _show_template_list(tm: TemplateManager) -> None:
-    for num, preview in tm.list_templates():
-        click.echo(f"  {num}. {preview}")
-
-
-def _pick_subject(business_name: str, trade: str, area: str, hook: str, template_num: int = 1) -> str:
-    """Generate subject line options with Claude if available, else prompt."""
-    if template_num == 2:
-        hardcoded = f"More Google reviews for {business_name}"
-    else:
-        hardcoded = f"Missed calls are losing {business_name} jobs"
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if anthropic_key:
-        try:
-            client = _make_anthropic_client(anthropic_key)
-            subjects = generate_subjects(client, business_name, trade, area, hook, template_num=template_num)
-            all_subjects = subjects + [hardcoded]
-            click.echo("\nSubject line options:")
-            for i, s in enumerate(all_subjects, 1):
-                click.echo(f"  {i}. {s}")
-            click.echo()
-            raw = click.prompt(
-                "Select subject [1-4] or type a custom one",
-                default="1",
-                show_default=True,
-            ).strip()
-            if raw in ("1", "2", "3", "4"):
-                return all_subjects[int(raw) - 1]
-            return raw
-        except Exception as exc:
-            log.warning(f"Subject generation failed: {exc}")
-
-    click.echo("\nSubject line options:")
-    click.echo(f"  1. {hardcoded}")
-    click.echo()
-    raw = click.prompt(
-        "Select subject [1] or type a custom one",
-        default="1",
-        show_default=True,
-    ).strip()
-    if raw == "1":
-        return hardcoded
-    return raw
+        update_lead_pipeline(
+            place_id,
+            scheduled_send_at=slot.isoformat(),
+            status="emailed",
+            sent_at=slot.isoformat(),
+        )
+        fu1, fu2 = followup_due_dates(slot.isoformat())
+        update_lead_pipeline(place_id, followup1_due=fu1, followup2_due=fu2)
+        click.echo(f"  Queued   : {slot_str}")
+        return True
+    except Exception as exc:
+        click.echo(f"  Queue failed: {exc}")
+        return False
 
 
 # ---------------------------------------------------------------------------
