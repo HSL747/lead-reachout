@@ -12,13 +12,18 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-DATABASE_URL     = os.environ["DATABASE_URL"]
-GMAIL_ADDRESS    = os.environ["GMAIL_ADDRESS"]
-GMAIL_TOKEN_JSON = os.environ["GMAIL_TOKEN_JSON"]   # full content of gmail_token.json
+DATABASE_URL  = os.environ["DATABASE_URL"]
+GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 
 
-def _get_service():
-    creds = Credentials.from_authorized_user_info(json.loads(GMAIL_TOKEN_JSON))
+def _get_service(conn):
+    """Load Gmail OAuth token from the settings table in Railway PostgreSQL."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM settings WHERE key = 'gmail_token_json'")
+        row = cur.fetchone()
+    if not row:
+        raise RuntimeError("gmail_token_json not found in settings table — run setup_worker_token.py")
+    creds = Credentials.from_authorized_user_info(json.loads(row[0]))
     if not creds.valid and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     return build("gmail", "v1", credentials=creds)
@@ -74,7 +79,7 @@ def run() -> None:
         conn.close()
         return
 
-    service = _get_service()
+    service = _get_service(conn)
     sent = errors = 0
     for row_id, to_email, subject, body_plain, body_html in rows:
         try:
