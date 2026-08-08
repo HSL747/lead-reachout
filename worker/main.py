@@ -1,18 +1,30 @@
-"""Railway cron worker — checks the send queue every 5 minutes and sends due emails."""
+"""Railway cron worker — checks the send queue every 5 minutes and sends due emails
+via the Gmail API (HTTPS) instead of SMTP, so it works inside Railway's network."""
+import base64
+import json
 import os
-import smtplib
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import psycopg2
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 DATABASE_URL     = os.environ["DATABASE_URL"]
 GMAIL_ADDRESS    = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PW     = os.environ["GMAIL_APP_PASSWORD"]
+GMAIL_TOKEN_JSON = os.environ["GMAIL_TOKEN_JSON"]   # full content of gmail_token.json
 
 
-def _send(to_email: str, subject: str, body_plain: str, body_html: str | None) -> None:
+def _get_service():
+    creds = Credentials.from_authorized_user_info(json.loads(GMAIL_TOKEN_JSON))
+    if not creds.valid and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return build("gmail", "v1", credentials=creds)
+
+
+def _send(service, to_email: str, subject: str, body_plain: str, body_html: str | None) -> None:
     msg = MIMEMultipart("alternative")
     msg["From"]    = GMAIL_ADDRESS
     msg["To"]      = to_email
@@ -20,9 +32,8 @@ def _send(to_email: str, subject: str, body_plain: str, body_html: str | None) -
     msg.attach(MIMEText(body_plain, "plain"))
     if body_html:
         msg.attach(MIMEText(body_html, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(GMAIL_ADDRESS, GMAIL_APP_PW)
-        smtp.sendmail(GMAIL_ADDRESS, to_email, msg.as_string())
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
 def _ensure_table(conn) -> None:
@@ -63,10 +74,11 @@ def run() -> None:
         conn.close()
         return
 
+    service = _get_service()
     sent = errors = 0
     for row_id, to_email, subject, body_plain, body_html in rows:
         try:
-            _send(to_email, subject, body_plain, body_html)
+            _send(service, to_email, subject, body_plain, body_html)
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(
