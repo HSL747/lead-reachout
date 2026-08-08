@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 
 from .companies_house import lookup_director
 from .export import export_csv_full
-from .gmail import authenticate as gmail_authenticate, build_html_body, create_draft as gmail_create_draft, get_signature_html, is_configured as gmail_is_configured, next_send_slot, send_draft as gmail_send_draft
+from .gmail import authenticate as gmail_authenticate, build_html_body, get_signature_html, is_configured as gmail_is_configured, next_send_slot, send_draft as gmail_send_draft
 from . import queue as send_queue
 from .hook_writer import generate_hooks
 from .models import Lead
@@ -161,16 +162,25 @@ def draft(lead_id: int | None, template_num: int | None, debug: bool) -> None:
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     ch_key        = os.environ.get("COMPANIES_HOUSE_API_KEY", "")
 
-    # Authenticate Gmail and initialise the Railway queue once
+    # Authenticate Gmail
     service  = None
     sig_html = ""
     if gmail_is_configured():
         try:
             service  = gmail_authenticate()
             sig_html = get_signature_html(service)
+        except Exception as exc:
+            click.echo(f"Gmail authentication failed: {exc}")
+
+    # Initialise Railway send queue — if this fails, disable queueing so we
+    # don't burn API credits generating hooks for emails that can't be sent.
+    if service:
+        try:
             send_queue.init_queue()
         except Exception as exc:
-            click.echo(f"Gmail setup failed: {exc}")
+            click.echo(f"Railway queue unavailable: {exc}")
+            click.echo("Check RAILWAY_DATABASE_URL in .env — drafts will be saved but not queued.")
+            service = None
 
     queued = skipped = 0
 
@@ -204,7 +214,6 @@ def _auto_pick_template(review_count: int) -> int:
     <35 reviews  → 30 % missed-call, 70 % reviews.
     Either template is always possible.
     """
-    import random
     if review_count >= 35:
         return random.choices([1, 2], weights=[70, 30])[0]
     return random.choices([1, 2], weights=[30, 70])[0]
@@ -219,7 +228,6 @@ def _auto_pick_subject(
     anthropic_key: str,
 ) -> str:
     """Generate subject lines and pick one at random."""
-    import random
     hardcoded = (
         f"More Google reviews for {business_name}"
         if template_num == 2
@@ -230,7 +238,7 @@ def _auto_pick_subject(
             client = _make_anthropic_client(anthropic_key)
             subjects = generate_subjects(client, business_name, trade, area, hook, template_num=template_num)
             pool = [s for s in subjects if s] + [hardcoded]
-            return random.choice(pool)
+            return random.choice(pool)  # noqa: S311
         except Exception as exc:
             log.warning(f"Subject generation failed: {exc}")
     return hardcoded
@@ -323,9 +331,9 @@ def _draft_one(
         click.echo(f"  Name     : {confirmed_name}  [reviews/about page]")
     else:
         confirmed_name = ""
-        click.echo("  Name     : (none found)")
+        click.echo("  Name     : (none found — using 'there')")
 
-    # Fill template
+    # Fill template — fall back to "there" so {{name}} is never left bare
     try:
         fill_kwargs: dict[str, str] = dict(
             company=display_name,
@@ -333,9 +341,8 @@ def _draft_one(
             trade_plural=_trade_plural(trade),
             area=area or "your area",
             hook=selected_hook,
+            name=confirmed_name or "there",
         )
-        if confirmed_name:
-            fill_kwargs["name"] = confirmed_name
         draft_text = tm.fill(template_num, **fill_kwargs)
     except ValueError as exc:
         click.echo(f"  Skipped — template error: {exc}")
